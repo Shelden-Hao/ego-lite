@@ -1,16 +1,22 @@
 #!/bin/sh
 #v1.5 2026.06.04 17:16
+#v1.6 2026.10.20 Windows support: download and run the official x64 installer
 
 set -eu
 
 # Default package URL and installation paths.
 DMG_URL_ARM64="https://cdn.ego.app/setup/macos/arm64/egolite-fHoqgZ74bOEM.dmg"
 DMG_URL_X64="https://cdn.ego.app/setup/macos/x64/egolite-fHoqgZ74bOEM.dmg"
+EXE_URL_X64="https://cdn.ego.app/setup/windows/x64/egoliteSetup-fHoqgZ74bOEM.exe"
 APP_NAME="ego lite"
 APP_BUNDLE_NAME="$APP_NAME.app"
 APP_PATH="/Applications/$APP_BUNDLE_NAME"
 USER_APP_PATH="$HOME/Applications/$APP_BUNDLE_NAME"
 EGO_BROWSER_HELPER_NAME="ego-browser"
+EXE_NAME="egoliteSetup.exe"
+
+# Seconds to wait for the interactive Windows installer to finish.
+WINDOWS_INSTALL_TIMEOUT=600
 
 # Temporary directories created when mounting the DMG; cleaned up on exit.
 TEMP_DIR=""
@@ -212,9 +218,128 @@ install_ego_lite() {
 	die "cannot find $APP_NAME app or pkg in mounted DMG"
 }
 
-main() {
-	[ "$(uname -s)" = "Darwin" ] || die "this script only supports macOS; on Windows and other platforms install from https://lite.ego.app/"
+# --- Windows ----------------------------------------------------------------
+# Everything below runs under Git Bash, MSYS2, or Cygwin. Paths coming from
+# Windows environment variables are converted with cygpath so that `test -d`,
+# `find`, and `curl` all see the same filesystem view.
 
+win_to_posix() {
+	if command -v cygpath >/dev/null 2>&1; then
+		cygpath -u "$1" 2>/dev/null || printf '%s\n' "$1"
+	elif [ -n "$1" ]; then
+		printf '%s\n' "$1"
+	fi
+}
+
+posix_to_win() {
+	if command -v cygpath >/dev/null 2>&1; then
+		cygpath -w "$1" 2>/dev/null || printf '%s\n' "$1"
+	else
+		printf '%s\n' "$1"
+	fi
+}
+
+win_env() {
+	# Windows variable names are case-insensitive, but the environment Git Bash
+	# exports is not, so try the spellings actually seen in the wild.
+	for name in "$@"; do
+		value=$(printenv "$name" 2>/dev/null || true)
+		if [ -n "$value" ]; then
+			printf '%s\n' "$value"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+is_ego_lite_dir() {
+	dir="$1"
+	[ -n "$dir" ] || return 1
+	[ -d "$dir" ] || return 1
+
+	# Chromium ships the helper as an .exe on Windows; fall back to a .cmd shim.
+	[ -f "$dir/$EGO_BROWSER_HELPER_NAME.exe" ] ||
+		[ -f "$dir/$EGO_BROWSER_HELPER_NAME.cmd" ] ||
+		[ -f "$dir/$EGO_BROWSER_HELPER_NAME" ]
+}
+
+find_ego_lite_dir() {
+	local_app_data=$(win_to_posix "$(win_env LOCALAPPDATA || true)")
+	program_files=$(win_to_posix "$(win_env ProgramFiles PROGRAMFILES || true)")
+	# The variable name contains parentheses, so ${...} expansion cannot be used.
+	program_files_x86=$(win_to_posix "$(win_env 'ProgramFiles(x86)' 'PROGRAMFILES(X86)' || true)")
+
+	# Per-user installs land in LOCALAPPDATA; machine-wide installs in Program Files.
+	for dir in \
+		"$local_app_data/Programs/$APP_NAME" \
+		"$local_app_data/$APP_NAME" \
+		"$program_files/$APP_NAME" \
+		"$program_files_x86/$APP_NAME"; do
+		if is_ego_lite_dir "$dir"; then
+			printf '%s\n' "$dir"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+install_ego_lite_windows() {
+	require_command curl
+
+	case "$(uname -m)" in
+		x86_64 | amd64) ;;
+		*)
+			die "$APP_NAME ships an x64 installer only. Download the build for this CPU from https://lite.ego.app/"
+			;;
+	esac
+
+	temp_base_dir=${TMPDIR:-/tmp}
+	temp_base_dir=${temp_base_dir%/}
+	TEMP_DIR=$(mktemp -d "$temp_base_dir/ego-lite-install.XXXXXX")
+	exe_path="$TEMP_DIR/$EXE_NAME"
+
+	log "$APP_NAME is not installed. Downloading $EXE_URL_X64 ..."
+	curl -fL --retry 3 --output "$exe_path" "$EXE_URL_X64" ||
+		die "failed to download $APP_NAME from $EXE_URL_X64"
+
+	log "Installing $APP_NAME ..."
+	# The Windows build installs per user and raises its own UAC prompt, so run the
+	# installer instead of unpacking it. It may hand off to an elevated child and
+	# return immediately, so wait for the app directory rather than for the process.
+	cmd //c start "" "$(posix_to_win "$exe_path")" ||
+		die "failed to launch $exe_path"
+
+	waited=0
+	while [ "$waited" -lt "$WINDOWS_INSTALL_TIMEOUT" ]; do
+		if find_ego_lite_dir >/dev/null; then
+			return 0
+		fi
+		sleep 2
+		waited=$((waited + 2))
+	done
+
+	die "$APP_NAME was not installed within ${WINDOWS_INSTALL_TIMEOUT}s; finish the setup wizard and rerun this script"
+}
+
+launch_ego_lite() {
+	dir="$1"
+	exe="$dir/$APP_NAME.exe"
+
+	if [ ! -f "$exe" ]; then
+		# Fall back to the first top-level executable that mentions ego.
+		exe=$(find "$dir" -maxdepth 1 -type f -iname "*ego*.exe" 2>/dev/null | head -n 1)
+	fi
+
+	[ -n "$exe" ] && [ -f "$exe" ] ||
+		die "found $dir but not the $APP_NAME executable inside it"
+
+	cmd //c start "" "$(posix_to_win "$exe")" ||
+		die "failed to launch $exe"
+}
+
+main_macos() {
 	# Install first if not present; otherwise use the ego-browser bundled inside the app.
 	installed_app_path=$(find_ego_lite_app || true)
 	if [ -z "$installed_app_path" ]; then
@@ -229,6 +354,33 @@ main() {
 
 	log "Launching $APP_NAME ..."
 	exec open "$installed_app_path"
+}
+
+main_windows() {
+	installed_app_dir=$(find_ego_lite_dir || true)
+	if [ -z "$installed_app_dir" ]; then
+		install_ego_lite_windows
+		installed_app_dir=$(find_ego_lite_dir || true)
+		[ -n "$installed_app_dir" ] ||
+			die "$APP_NAME install completed, but the app directory was not found"
+	fi
+
+	cleanup
+
+	log "Launching $APP_NAME ..."
+	launch_ego_lite "$installed_app_dir"
+
+	log "Complete onboarding in $APP_NAME so it registers the $EGO_BROWSER_HELPER_NAME command on PATH, then open a new terminal: an existing one keeps the PATH it started with."
+}
+
+main() {
+	case "$(uname -s)" in
+		Darwin) main_macos ;;
+		MINGW* | MSYS* | CYGWIN*) main_windows ;;
+		*)
+			die "this script supports macOS and Windows; on other platforms install from https://lite.ego.app/"
+			;;
+	esac
 }
 
 main

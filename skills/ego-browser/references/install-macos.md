@@ -4,7 +4,7 @@ Read `install.md` first; it covers upgrading an older ego lite and the onboardin
 
 ## Run the install script
 
-The install script lives at `scripts/install.sh` in this skill and supports macOS only (`uname -s` is `Darwin`). It will:
+The install script lives at `scripts/install.sh` in this skill. It runs the macOS path when `uname -s` is `Darwin`; see `install-windows.md` for Windows. It will:
 
 - Download the ego lite installer (a DMG) for your CPU architecture (arm64 / x64).
 - Install `ego lite.app` to `/Applications` (falling back to `~/Applications` when needed).
